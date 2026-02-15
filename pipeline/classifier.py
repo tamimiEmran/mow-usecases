@@ -63,7 +63,7 @@ def _load_processor(model_name: str):
     (Llama-3 based), and the image processor is constructed with the standard
     CLIP-ViT-L/14-336px parameters used by all LLaVA-Next variants.
     """
-    from transformers import LlavaNextProcessor, AutoTokenizer, LlavaNextImageProcessor
+    from transformers import LlavaNextProcessor, AutoTokenizer
 
     # --- Attempt 1: direct load (works if cache has all files) ---
     try:
@@ -79,8 +79,7 @@ def _load_processor(model_name: str):
 
     # Image processor: standard CLIP-ViT-L/14-336px params
     # Same across all LLaVA-Next variants (vicuna, mistral, llama3)
-    logger.info("Constructing LlavaNextImageProcessor with CLIP-ViT-L/14-336px defaults")
-    image_processor = LlavaNextImageProcessor(
+    _clip_kwargs = dict(
         do_resize=True,
         size={"shortest_edge": 336},
         do_center_crop=True,
@@ -92,6 +91,15 @@ def _load_processor(model_name: str):
         image_std=[0.26862954, 0.26130258, 0.27577711],
         do_convert_rgb=True,
     )
+
+    try:
+        from transformers import LlavaNextImageProcessor
+        logger.info("Constructing LlavaNextImageProcessor with CLIP-ViT-L/14-336px defaults")
+        image_processor = LlavaNextImageProcessor(**_clip_kwargs)
+    except (ImportError, TypeError):
+        from transformers import CLIPImageProcessor
+        logger.info("Falling back to CLIPImageProcessor")
+        image_processor = CLIPImageProcessor(**_clip_kwargs)
 
     return LlavaNextProcessor(
         image_processor=image_processor,
@@ -117,7 +125,7 @@ def load_model(model_name: str, device: str = "cuda"):
         logger.info("Loading E5-V model weights: %s", model_name)
         _model = LlavaNextForConditionalGeneration.from_pretrained(
             model_name,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
         ).to(device).eval()
         _tokenizer = _processor.tokenizer
         logger.info("E5-V loaded on %s", device)
@@ -223,7 +231,7 @@ def encode_images(
         batch_embs = []
 
         for img in batch_imgs:
-            inputs = processor(IMAGE_PROMPT, img, return_tensors="pt")
+            inputs = processor(images=img, text=IMAGE_PROMPT, return_tensors="pt")
             inputs = {k: v.to(device) for k, v in inputs.items()}
 
             emb = _get_last_token_embedding(model, **inputs)
@@ -260,7 +268,7 @@ def encode_composed(
 
     if len(images) == 1:
         prompt = COMPOSED_PROMPT_SINGLE.format(text=text)
-        inputs = processor(prompt, images[0], return_tensors="pt")
+        inputs = processor(images=images[0], text=prompt, return_tensors="pt")
     else:
         # Multiple images: create multiple <image> tokens
         image_tokens = "<image>\n" * len(images)
@@ -269,7 +277,7 @@ def encode_composed(
             text=text,
         )
         # LlavaNext processor handles list of images mapped to <image> tokens
-        inputs = processor(prompt, images, return_tensors="pt")
+        inputs = processor(images=images, text=prompt, return_tensors="pt")
 
     inputs = {k: v.to(device) for k, v in inputs.items()}
     emb = _get_last_token_embedding(model, **inputs)

@@ -1,0 +1,38 @@
+{
+  "source_resolution": {
+    "w": 1920,
+    "h": 1080
+  },
+  "regions": [
+    {
+      "id": 1,
+      "name": "BEV Visualization",
+      "crop": { "x": 0, "y": 0, "w": 963, "h": 1080 }
+    },
+    {
+      "id": 2,
+      "name": "Telemetry HUD",
+      "crop": { "x": 720, "y": 9, "w": 238, "h": 325 }
+    },
+    {
+      "id": 3,
+      "name": "Left Fisheye",
+      "crop": { "x": 960, "y": 0, "w": 472, "h": 288 }
+    },
+    {
+      "id": 4,
+      "name": "Right Fisheye",
+      "crop": { "x": 1435, "y": 0, "w": 485, "h": 287 }
+    },
+    {
+      "id": 5,
+      "name": "Front Camera",
+      "crop": { "x": 961, "y": 289, "w": 930, "h": 507 }
+    },
+    {
+      "id": 6,
+      "name": "Rear Camera",
+      "crop": { "x": 1169, "y": 793, "w": 542, "h": 279 }
+    }
+  ]
+}

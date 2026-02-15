@@ -1,0 +1,17 @@
+# AV Video Classifier — Requirements
+# Install: pip install -r requirements.txt --break-system-packages
+
+# ML
+transformers>=4.45.0
+torch>=2.0.0
+
+# Computer Vision
+opencv-python-headless>=4.9.0
+Pillow>=10.0.0
+numpy>=1.26.0
+
+# UI
+gradio>=4.44.0
+
+# Utilities
+tqdm>=4.66.0

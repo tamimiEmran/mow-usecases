@@ -28,6 +28,7 @@ def _env_bool(key: str, default: bool) -> bool:
 @dataclass
 class StorageConfig:
     video_dir: str = field(default_factory=lambda: _env("VIDEO_DIR", "/workspace/video-inference/videos/cropped"))
+    full_video_dir: str = field(default_factory=lambda: _env("FULL_VIDEO_DIR", "/workspace/video-inference/videos/all"))
     cache_dir: str = field(default_factory=lambda: _env("CACHE_DIR", "/workspace/cache"))
     crop_config: str = field(default_factory=lambda: _env("CROP_CONFIG", "config/crop_config.json"))
 

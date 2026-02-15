@@ -1,9 +1,10 @@
 # AV Video Classifier — Requirements
 # Install: pip install -r requirements.txt --break-system-packages
 
-# ML
+# ML / E5-V (LLaVA-Next 8B backbone)
 transformers>=4.45.0
 torch>=2.0.0
+accelerate>=0.34.0
 
 # Computer Vision
 opencv-python-headless>=4.9.0

@@ -1,16 +1,14 @@
 """Gradio UI — tabbed interface for video classification.
 
 Tab per use case. Each tab has the same workflow:
-1. Embed videos (shared across tabs)
-2. Run zero-shot classification
-3. Verify top candidates
-4. Run few-shot refinement
-5. View final results
+1. Embed videos (shared across tabs) — E5-V image embeddings
+2. Run zero-shot classification — E5-V text vs image embeddings
+3. Verify top candidates — human marks positive/negative
+4. Run few-shot — E5-V composed (text + example images) vs cached image embeddings
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 
@@ -19,7 +17,6 @@ import gradio as gr
 from app.config import settings
 from data.models import (
     ALL_USECASES,
-    BUS_STOP_USECASE,
     UseCase,
 )
 from pipeline.cache import Cache
@@ -76,8 +73,6 @@ def _run_embedding(progress=gr.Progress()):
 # ═══════════════════════════════════════════════════════════════════
 
 def _make_zero_shot_handler(usecase: UseCase):
-    """Factory: create a zero-shot handler for a specific use case."""
-
     def handler(progress=gr.Progress()):
         runner = _get_runner()
 
@@ -89,7 +84,6 @@ def _make_zero_shot_handler(usecase: UseCase):
         if not results:
             return "No results. Run embedding first.", [], _status_text()
 
-        # Format results table
         table_data = []
         for r in results:
             table_data.append([
@@ -116,8 +110,6 @@ def _make_zero_shot_handler(usecase: UseCase):
 
 
 def _make_load_verification_handler(usecase: UseCase):
-    """Factory: load candidates for verification."""
-
     def handler(verify_index: int):
         cache = _get_cache()
         results = cache.load_results(usecase.name, "zeroshot")
@@ -125,22 +117,20 @@ def _make_load_verification_handler(usecase: UseCase):
         if not results:
             return (
                 "Run zero-shot first.",
-                None,  # gallery
-                0,     # index
-                "",    # source_id display
-                gr.update(interactive=False),  # confirm btn
-                gr.update(interactive=False),  # reject btn
-                gr.update(interactive=False),  # skip btn
+                None,
+                0,
+                "",
+                gr.update(interactive=False),
+                gr.update(interactive=False),
+                gr.update(interactive=False),
             )
 
-        # Clamp index
         idx = int(verify_index) if verify_index else 0
         idx = max(0, min(idx, len(results) - 1))
 
         r = results[idx]
         thumbs = r.get("thumbnails", [])
 
-        # Check if already labeled
         labels = cache.load_labels(usecase.name) or {}
         existing = labels.get(r["source_id"], "")
 
@@ -166,8 +156,6 @@ def _make_load_verification_handler(usecase: UseCase):
 
 
 def _make_label_handler(usecase: UseCase, label_type: str):
-    """Factory: save a verification label and advance."""
-
     def handler(verify_index: int, current_source_id: str):
         cache = _get_cache()
         results = cache.load_results(usecase.name, "zeroshot")
@@ -175,15 +163,12 @@ def _make_label_handler(usecase: UseCase, label_type: str):
         if not results or not current_source_id:
             return verify_index, "No results loaded."
 
-        # Save label
         cache.save_labels(usecase.name, {current_source_id: label_type})
-
-        # Advance index
         next_idx = min(int(verify_index) + 1, len(results) - 1)
 
         counts = cache.count_labels(usecase.name)
         msg = (
-            f"✓ Labeled `{current_source_id}` as **{label_type}**\n\n"
+            f"Labeled `{current_source_id}` as **{label_type}**\n\n"
             f"Labels so far: {counts['positive']} positive, "
             f"{counts['negative']} negative, {counts['skip']} skipped"
         )
@@ -194,15 +179,17 @@ def _make_label_handler(usecase: UseCase, label_type: str):
 
 
 def _make_few_shot_handler(usecase: UseCase):
-    """Factory: run few-shot classification."""
-
     def handler(progress=gr.Progress()):
         runner = _get_runner()
         cache = _get_cache()
 
         counts = cache.count_labels(usecase.name)
         if counts["positive"] == 0:
-            return "Need at least 1 positive example. Verify some candidates first.", [], _status_text()
+            return (
+                "Need at least 1 positive example. Verify some candidates first.",
+                [],
+                _status_text(),
+            )
 
         def prog(frac, msg):
             progress(frac, desc=msg)
@@ -227,10 +214,13 @@ def _make_few_shot_handler(usecase: UseCase):
 
         summary = (
             f"**Few-shot results for: {usecase.name}**\n\n"
-            f"- Using {counts['positive']} positive + {counts['negative']} negative examples\n"
-            f"- Timestamps classified: {len(results)}\n"
+            f"- Composed query: `{usecase.target_label[:60]}` "
+            f"+ {counts['positive']} positive images"
+            f"{f' + ' + str(counts.get('negative', 0)) + ' negative images' if counts.get('negative', 0) > 0 else ''}\n"
+            f"- Timestamps re-ranked: {len(results)}\n"
             f"- Top match: {results[0]['source_id']} "
-            f"(conf: {results[0]['target_confidence']:.3f})"
+            f"(conf: {results[0]['target_confidence']:.3f})\n\n"
+            f"*Same cached image embeddings — only the query changed.*"
             if results else "No results."
         )
 
@@ -254,9 +244,9 @@ def _status_text() -> str:
             f"- **{status['total_timestamps']}** timestamps "
             f"({status['total_videos']} videos)",
             f"- **{status['embedded_sources']}** embedded",
+            f"- Model: `{settings.model.model_name}`",
         ]
 
-        # Per-usecase label counts
         for uc in ALL_USECASES:
             counts = cache.count_labels(uc.name)
             if counts["total"] > 0:
@@ -275,8 +265,6 @@ def _status_text() -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 def _build_usecase_tab(usecase: UseCase):
-    """Build the complete UI for one use-case tab."""
-
     with gr.Tab(usecase.name):
         gr.Markdown(f"### {usecase.name}\n{usecase.description}")
         gr.Markdown(
@@ -286,6 +274,10 @@ def _build_usecase_tab(usecase: UseCase):
 
         # ── Step 1: Zero-Shot ────────────────────────────────
         with gr.Accordion("Step 1: Zero-Shot Classification", open=True):
+            gr.Markdown(
+                "E5-V encodes your text labels and all frame images into the "
+                "same vector space, then ranks by cosine similarity."
+            )
             zs_btn = gr.Button("▶ Run Zero-Shot", variant="primary")
             zs_summary = gr.Markdown("")
             zs_table = gr.Dataframe(
@@ -298,6 +290,12 @@ def _build_usecase_tab(usecase: UseCase):
 
         # ── Step 2: Verify ───────────────────────────────────
         with gr.Accordion("Step 2: Verify Top Candidates", open=False):
+            gr.Markdown(
+                "Review zero-shot candidates. **Positive** = genuinely shows the "
+                "target scenario. **Negative** = false positive.\n\n"
+                "These example images will be combined with the text description "
+                "into a single composed embedding for few-shot re-ranking."
+            )
             with gr.Row():
                 verify_idx = gr.Number(
                     value=0, label="Candidate #", precision=0, minimum=0,
@@ -324,19 +322,28 @@ def _build_usecase_tab(usecase: UseCase):
             label_status = gr.Markdown("")
 
         # ── Step 3: Few-Shot ─────────────────────────────────
-        with gr.Accordion("Step 3: Few-Shot Refinement", open=False):
+        with gr.Accordion("Step 3: Few-Shot Re-ranking", open=False):
+            gr.Markdown(
+                "E5-V creates a **composed embedding** from the target text + "
+                "your verified example images → one query vector.\n\n"
+                "This single vector captures both *what you described* and "
+                "*what it actually looks like in your footage*. "
+                "All timestamps are re-ranked against this composed query "
+                "using the same cached image embeddings — instant re-ranking, "
+                "no re-embedding needed."
+            )
             fs_btn = gr.Button("▶ Run Few-Shot", variant="primary")
             fs_summary = gr.Markdown("")
             fs_table = gr.Dataframe(
                 headers=["Source ID", "Vehicle", "Date",
-                         "Target Conf", "Predicted", "Human"],
+                         "Target Conf", "Predicted", "Human Label"],
                 datatype=["str", "str", "str", "str", "str", "str"],
                 interactive=False,
                 wrap=True,
             )
 
         # ── Wire events ──────────────────────────────────────
-        status_out = gr.Markdown()  # connected to shared status outside
+        status_out = gr.Markdown()
 
         zs_handler = _make_zero_shot_handler(usecase)
         zs_btn.click(
@@ -352,7 +359,6 @@ def _build_usecase_tab(usecase: UseCase):
                      current_source, confirm_btn, reject_btn, skip_btn],
         )
 
-        # Label buttons: save + advance + reload
         for btn, ltype in [(confirm_btn, "positive"),
                            (reject_btn, "negative"),
                            (skip_btn, "skip")]:
@@ -393,12 +399,12 @@ def create_ui() -> gr.Blocks:
         gr.Markdown(
             "# 🚗 AV Video Classifier\n"
             "Zero-shot → verify → few-shot classification pipeline "
-            "for autonomous vehicle fleet video."
+            "for autonomous vehicle fleet video.\n\n"
+            f"**Model:** `{settings.model.model_name}` — unified text/image/composed embeddings"
         )
 
         with gr.Row():
             with gr.Column(scale=3):
-                # ── Shared: Embedding ────────────────────────
                 with gr.Accordion("Embed Videos (shared across all tabs)", open=True):
                     gr.Markdown(
                         f"Video directory: `{settings.storage.video_dir}`\n\n"
@@ -418,12 +424,11 @@ def create_ui() -> gr.Blocks:
             outputs=[embed_output, status_panel],
         )
 
-        # ── Use-case tabs ────────────────────────────────────
         with gr.Tabs():
             for usecase in ALL_USECASES:
                 _build_usecase_tab(usecase)
 
-            # Tab 5: Custom Query (placeholder)
+            # Tab 5: Custom Query
             with gr.Tab("Custom Query"):
                 gr.Markdown(
                     "### Custom Zero-Shot Query\n\n"
@@ -443,7 +448,7 @@ def create_ui() -> gr.Blocks:
                     placeholder="a vehicle making an illegal U-turn",
                 )
                 custom_btn = gr.Button("▶ Run Custom Classification", variant="primary")
-                custom_output = gr.Markdown("*Coming soon*")
+                custom_output = gr.Markdown("*Enter labels above*")
                 custom_table = gr.Dataframe(
                     headers=["Source ID", "Vehicle", "Date",
                              "Target Conf", "Predicted", "Frames"],
@@ -454,16 +459,16 @@ def create_ui() -> gr.Blocks:
                     if not labels_text.strip() or not target.strip():
                         return "Enter labels and target.", []
 
-                    labels = [l.strip() for l in labels_text.strip().split("\n") if l.strip()]
-                    if len(labels) < 2:
+                    labels_list = [l.strip() for l in labels_text.strip().split("\n") if l.strip()]
+                    if len(labels_list) < 2:
                         return "Need at least 2 labels.", []
-                    if target not in labels:
-                        labels.insert(0, target)
+                    if target not in labels_list:
+                        labels_list.insert(0, target)
 
                     custom_uc = UseCase(
                         name="Custom",
                         description="User-defined query",
-                        labels=labels,
+                        labels=labels_list,
                         target_label=target,
                     )
 

@@ -46,19 +46,31 @@ class StorageConfig:
 
 @dataclass
 class ModelConfig:
-    model_name: str = field(default_factory=lambda: _env("CLASSIFIER_MODEL", "google/siglip-so400m-patch14-384"))
+    """E5-V unified multimodal embedding model.
+
+    Single model for text, image, and composed (text+image) embeddings.
+    All share the same vector space.
+    """
+    model_name: str = field(default_factory=lambda: _env("MODEL", "royokong/e5-v"))
     device: str = field(default_factory=lambda: _env("DEVICE", "cuda"))
-    batch_size: int = field(default_factory=lambda: _env_int("BATCH_SIZE", 32))
+    batch_size: int = field(default_factory=lambda: _env_int("BATCH_SIZE", 8))
+
+
+@dataclass
+class FewShotConfig:
+    """Few-shot composed embedding settings."""
+    # How many verified positive example images to include in the composed query
+    max_positive_examples: int = field(default_factory=lambda: _env_int("MAX_POS_EXAMPLES", 4))
+    # How many verified negative example images for the negative query
+    max_negative_examples: int = field(default_factory=lambda: _env_int("MAX_NEG_EXAMPLES", 4))
 
 
 @dataclass
 class PipelineConfig:
     frames_per_video: int = field(default_factory=lambda: _env_int("FRAMES_PER_VIDEO", 5))
-    # Cameras to classify (skip BEV and telemetry)
     cameras: list[str] = field(default_factory=lambda: [
         "front_camera", "left_fisheye", "right_fisheye", "rear_camera",
     ])
-    # How many top candidates to show for verification
     verification_top_k: int = field(default_factory=lambda: _env_int("VERIFY_TOP_K", 50))
 
 
@@ -73,6 +85,7 @@ class ServerConfig:
 class Settings:
     storage: StorageConfig = field(default_factory=StorageConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    fewshot: FewShotConfig = field(default_factory=FewShotConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
 

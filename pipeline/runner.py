@@ -1,9 +1,13 @@
 """Pipeline runner — orchestrates the full classification workflow.
 
 1. Discover timestamps
-2. Extract frames + compute embeddings (cached)
-3. Zero-shot classify all timestamps
-4. (After human verification) Build prototypes → few-shot re-classify
+2. Extract frames + compute E5-V image embeddings (cached)
+3. Zero-shot: E5-V text embeddings for labels, cosine similarity
+4. Human verification: mark positive/negative examples
+5. Few-shot: E5-V composed embedding (text + example images) → re-rank
+
+Key insight: image embeddings from step 2 are reused in both steps 3 and 5
+because E5-V puts text, image, and composed embeddings in the same space.
 """
 
 from __future__ import annotations
@@ -14,12 +18,13 @@ from pathlib import Path
 from typing import Callable
 
 import numpy as np
+from PIL import Image
 
 from app.config import settings
 from data.models import UseCase
 from pipeline.cache import Cache
 from pipeline.classifier import (
-    build_prototypes,
+    encode_composed,
     encode_images,
     few_shot_classify,
     zero_shot_classify,
@@ -46,13 +51,10 @@ class PipelineRunner:
         video_dir: str | None = None,
         progress: Callable[[float, str], None] | None = None,
     ) -> dict:
-        """Extract frames and compute embeddings for all timestamps.
+        """Extract frames and compute E5-V image embeddings for all timestamps.
 
         Skips timestamps that already have cached embeddings.
-
-        Returns
-        -------
-        dict with total, embedded, skipped, time_s
+        These embeddings are reused for both zero-shot and few-shot.
         """
         timestamps = discover_timestamps(video_dir)
         total = len(timestamps)
@@ -71,7 +73,6 @@ class PipelineRunner:
                 continue
 
             try:
-                # Extract frames
                 frames_data = extract_all_frames_for_timestamp(
                     camera_paths,
                     n_frames=settings.pipeline.frames_per_video,
@@ -100,7 +101,7 @@ class PipelineRunner:
                         fi.source_id, fi.camera, fi.frame_idx,
                     )
 
-                # Compute embeddings
+                # Compute E5-V image embeddings
                 embeddings = encode_images(
                     images,
                     model_name=settings.model.model_name,
@@ -108,7 +109,6 @@ class PipelineRunner:
                     batch_size=settings.model.batch_size,
                 )
 
-                # Cache
                 self.cache.save_embeddings(source_id, embeddings, infos)
                 embedded += 1
 
@@ -141,7 +141,7 @@ class PipelineRunner:
         usecase: UseCase,
         progress: Callable[[float, str], None] | None = None,
     ) -> list[dict]:
-        """Run zero-shot classification on all embedded timestamps.
+        """Zero-shot: E5-V text embeddings vs cached image embeddings.
 
         Returns sorted list of timestamp results (highest target confidence first).
         """
@@ -161,7 +161,6 @@ class PipelineRunner:
 
             embeddings, frame_infos = loaded
 
-            # Classify
             frame_scores = zero_shot_classify(
                 embeddings,
                 labels=usecase.labels,
@@ -180,7 +179,6 @@ class PipelineRunner:
             confidence = avg_scores[predicted]
             target_confidence = avg_scores[usecase.target_label]
 
-            # Parse metadata from first frame info
             fi0 = frame_infos[0] if frame_infos else {}
             from data.video_parser import parse_video_filename
             parsed = parse_video_filename(
@@ -204,78 +202,121 @@ class PipelineRunner:
             if progress:
                 progress((i + 1) / total, f"Classified {source_id}")
 
-        # Sort by target class confidence (descending)
         all_results.sort(key=lambda r: r["target_confidence"], reverse=True)
 
         elapsed = round(time.time() - t0, 1)
-        logger.info("Zero-shot complete: %d timestamps in %.1fs", len(all_results), elapsed)
+        logger.info("Zero-shot complete: %d timestamps in %.1fs",
+                    len(all_results), elapsed)
 
-        # Cache results
         self.cache.save_results(usecase.name, "zeroshot", all_results)
-
         return all_results
 
     # ── Step 3: Few-shot classify ────────────────────────────────
+
+    def _select_example_thumbnail(
+        self,
+        thumbnails: list[str],
+        prefer_camera: str = "front_camera",
+    ) -> str | None:
+        """Pick the best single thumbnail from a timestamp's thumbnails."""
+        if not thumbnails:
+            return None
+        # Prefer front camera middle frame
+        front = [t for t in thumbnails if prefer_camera in t]
+        if front:
+            return front[len(front) // 2]
+        return thumbnails[len(thumbnails) // 2]
 
     def run_few_shot(
         self,
         usecase: UseCase,
         progress: Callable[[float, str], None] | None = None,
     ) -> list[dict]:
-        """Run few-shot classification using verified examples as prototypes.
+        """Few-shot: build composed embedding from text + verified examples.
 
-        Requires labels saved via cache.save_labels().
+        Workflow:
+        1. Collect thumbnail images from verified positive/negative timestamps
+        2. Create composed E5-V embedding: target_description + positive images → query vector
+        3. (Optional) Create composed negative embedding: "not target" + negative images
+        4. Compare query vector against ALL cached image embeddings via cosine similarity
+        5. Re-rank all timestamps
 
-        Returns sorted list of timestamp results.
+        The cached image embeddings from step 1 are reused — no re-embedding needed!
         """
         labels = self.cache.load_labels(usecase.name)
         if not labels:
             logger.warning("No verification labels found for '%s'", usecase.name)
             return []
 
-        # Build prototype embeddings from labeled examples
-        positive_embs = []
-        negative_embs = []
+        # Gather example images
+        positive_images: list[Image.Image] = []
+        negative_images: list[Image.Image] = []
+
+        max_pos = settings.fewshot.max_positive_examples
+        max_neg = settings.fewshot.max_negative_examples
+
+        pos_count = 0
+        neg_count = 0
 
         for source_id, label in labels.items():
-            loaded = self.cache.load_embeddings(source_id)
-            if loaded is None:
-                continue
-            embeddings, _ = loaded
+            if label == "positive" and pos_count < max_pos:
+                thumb = self._select_example_thumbnail(
+                    self.cache.list_thumbnails(source_id)
+                )
+                if thumb:
+                    try:
+                        positive_images.append(Image.open(thumb).convert("RGB"))
+                        pos_count += 1
+                    except Exception as e:
+                        logger.warning("Cannot load thumbnail %s: %s", thumb, e)
 
-            if label == "positive":
-                # Use all frame embeddings from this timestamp
-                for emb in embeddings:
-                    positive_embs.append(emb)
-            elif label == "negative":
-                for emb in embeddings:
-                    negative_embs.append(emb)
+            elif label == "negative" and neg_count < max_neg:
+                thumb = self._select_example_thumbnail(
+                    self.cache.list_thumbnails(source_id)
+                )
+                if thumb:
+                    try:
+                        negative_images.append(Image.open(thumb).convert("RGB"))
+                        neg_count += 1
+                    except Exception as e:
+                        logger.warning("Cannot load thumbnail %s: %s", thumb, e)
 
-        if not positive_embs:
-            logger.warning("No positive examples to build prototypes")
+        if not positive_images:
+            logger.warning("No positive example images found")
             return []
-        if not negative_embs:
-            logger.warning("No negative examples — using zero-shot fallback for negative class")
-            # Use text embedding as fallback negative prototype
-            from pipeline.classifier import encode_texts
+
+        logger.info(
+            "Building composed embeddings: %d positive, %d negative images",
+            len(positive_images), len(negative_images),
+        )
+
+        if progress:
+            progress(0.05, "Building positive query embedding...")
+
+        # Build composed positive query: text + positive example images
+        positive_query = encode_composed(
+            text=usecase.target_label,
+            images=positive_images,
+            model_name=settings.model.model_name,
+            device=settings.model.device,
+        )
+
+        # Build composed negative query if we have negative examples
+        negative_query = None
+        if negative_images:
+            if progress:
+                progress(0.1, "Building negative query embedding...")
+
+            # Use first non-target label as negative text
             neg_text = [l for l in usecase.labels if l != usecase.target_label]
-            if neg_text:
-                negative_embs = list(encode_texts(
-                    neg_text[:1],
-                    settings.model.model_name,
-                    settings.model.device,
-                ))
+            negative_query = encode_composed(
+                text=neg_text[0] if neg_text else "not " + usecase.target_label,
+                images=negative_images,
+                model_name=settings.model.model_name,
+                device=settings.model.device,
+            )
 
-        prototypes = build_prototypes({
-            "positive": positive_embs,
-            "negative": negative_embs,
-        })
-
-        if len(prototypes) < 2:
-            logger.warning("Need at least 2 prototype classes")
-            return []
-
-        # Classify all timestamps
+        # Classify all timestamps against composed query
         sources = self.cache.list_embedded_sources()
         all_results = []
         t0 = time.time()
@@ -287,21 +328,17 @@ class PipelineRunner:
 
             embeddings, frame_infos = loaded
 
+            # Few-shot classify using composed embeddings
             frame_scores = few_shot_classify(
-                embeddings,
-                prototypes=prototypes,
+                image_embeddings=embeddings,
+                query_embedding=positive_query,
+                negative_embedding=negative_query,
                 temperature=0.5,
             )
 
-            avg_scores = {}
-            for label in prototypes:
-                avg_scores[label] = float(np.mean([
-                    fs[label] for fs in frame_scores
-                ]))
-
-            predicted = max(avg_scores, key=avg_scores.get)
-            confidence = avg_scores[predicted]
-            target_confidence = avg_scores.get("positive", 0.0)
+            # Aggregate across frames
+            avg_pos = float(np.mean([fs["positive"] for fs in frame_scores]))
+            avg_neg = float(np.mean([fs["negative"] for fs in frame_scores]))
 
             fi0 = frame_infos[0] if frame_infos else {}
             from data.video_parser import parse_video_filename
@@ -316,10 +353,10 @@ class PipelineRunner:
                 "vehicle_id": parsed["vehicle_id"] if parsed else "",
                 "date": parsed["date"] if parsed else "",
                 "datetime_utc": parsed["datetime_utc"] if parsed else "",
-                "avg_scores": avg_scores,
-                "predicted_label": predicted,
-                "confidence": confidence,
-                "target_confidence": target_confidence,
+                "avg_scores": {"positive": avg_pos, "negative": avg_neg},
+                "predicted_label": "positive" if avg_pos > avg_neg else "negative",
+                "confidence": max(avg_pos, avg_neg),
+                "target_confidence": avg_pos,
                 "n_frames": len(frame_infos),
                 "thumbnails": self.cache.list_thumbnails(source_id),
                 "human_label": human_label,
@@ -327,12 +364,20 @@ class PipelineRunner:
             all_results.append(result)
 
             if progress:
-                progress((i + 1) / len(sources), f"Classified {source_id}")
+                progress(
+                    0.15 + 0.85 * (i + 1) / len(sources),
+                    f"Classified {source_id}",
+                )
 
         all_results.sort(key=lambda r: r["target_confidence"], reverse=True)
 
         elapsed = round(time.time() - t0, 1)
-        logger.info("Few-shot complete: %d timestamps in %.1fs", len(all_results), elapsed)
+        logger.info(
+            "Few-shot complete: %d timestamps in %.1fs "
+            "(using %d pos + %d neg examples)",
+            len(all_results), elapsed,
+            len(positive_images), len(negative_images),
+        )
 
         self.cache.save_results(usecase.name, "fewshot", all_results)
         return all_results

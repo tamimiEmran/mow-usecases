@@ -46,12 +46,12 @@ class StorageConfig:
 
 @dataclass
 class ModelConfig:
-    """E5-V unified multimodal embedding model.
+    """LLaVA-Next multimodal model for unified embeddings.
 
-    Single model for text, image, and composed (text+image) embeddings.
-    All share the same vector space.
+    Uses last-token hidden state as embedding vector for text, image,
+    and composed (text+image) inputs — all in the same vector space.
     """
-    model_name: str = field(default_factory=lambda: _env("MODEL", "royokong/e5-v"))
+    model_name: str = field(default_factory=lambda: _env("MODEL", "llava-hf/llava-v1.6-mistral-7b-hf"))
     device: str = field(default_factory=lambda: _env("DEVICE", "cuda"))
     batch_size: int = field(default_factory=lambda: _env_int("BATCH_SIZE", 8))
 

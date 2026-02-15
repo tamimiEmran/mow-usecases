@@ -62,7 +62,7 @@ class UseCase:
 
 BUS_STOP_USECASE = UseCase(
     name="Bus Stop Violations",
-    description="Detect vehicles parked at bus stops",
+    description="Detect vehicles illegally parked or stopped at bus stops",
     labels=[
         "a bus stop with a car or vehicle parked at it",
         "a bus stop with no car or vehicle parked at it",
@@ -71,42 +71,32 @@ BUS_STOP_USECASE = UseCase(
     target_label="a bus stop with a car or vehicle parked at it",
 )
 
-SIGN_OBSTRUCTION_USECASE = UseCase(
-    name="Sign Obstruction",
-    description="Traffic signs obscured by vegetation or objects",
+SIGN_MAINTENANCE_USECASE = UseCase(
+    name="Sign Maintenance",
+    description="Traffic signs that need maintenance — damaged, faded, tilted, obscured by vegetation, or missing",
     labels=[
-        "a traffic sign partially or fully obscured by trees or vegetation",
-        "a clearly visible traffic sign with no obstruction",
+        "a traffic sign that is damaged bent faded or needs repair",
+        "a traffic sign obscured or hidden by overgrown vegetation",
+        "a clearly visible traffic sign in good condition",
         "a road scene with no traffic signs",
     ],
-    target_label="a traffic sign partially or fully obscured by trees or vegetation",
+    target_label="a traffic sign that is damaged bent faded or needs repair",
 )
 
-PEDESTRIAN_CROSSING_USECASE = UseCase(
-    name="Pedestrian Crossings",
-    description="Pedestrians crossing outside crosswalks",
+STREET_VANDALISM_USECASE = UseCase(
+    name="Street Damage & Vandalism",
+    description="Graffiti, vandalism on walls or street furniture, damaged infrastructure, illegal dumping",
     labels=[
-        "a pedestrian jaywalking or crossing outside a crosswalk",
-        "a pedestrian using a crosswalk properly",
-        "a road scene with no pedestrians crossing",
+        "graffiti or vandalism on a wall building or street furniture",
+        "damaged or broken street infrastructure like benches signs or poles",
+        "illegal dumping or trash accumulation on the street",
+        "a clean street scene with no vandalism or damage",
     ],
-    target_label="a pedestrian jaywalking or crossing outside a crosswalk",
-)
-
-CONSTRUCTION_USECASE = UseCase(
-    name="Construction Zones",
-    description="Roadwork, construction zones, lane closures",
-    labels=[
-        "a road construction zone with barriers cones or workers",
-        "a normal road with no construction",
-        "a road scene with minor obstructions",
-    ],
-    target_label="a road construction zone with barriers cones or workers",
+    target_label="graffiti or vandalism on a wall building or street furniture",
 )
 
 ALL_USECASES = [
     BUS_STOP_USECASE,
-    SIGN_OBSTRUCTION_USECASE,
-    PEDESTRIAN_CROSSING_USECASE,
-    CONSTRUCTION_USECASE,
+    SIGN_MAINTENANCE_USECASE,
+    STREET_VANDALISM_USECASE,
 ]

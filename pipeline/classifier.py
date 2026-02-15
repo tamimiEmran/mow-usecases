@@ -1,10 +1,11 @@
-"""E5-V unified multimodal classifier.
+"""LLaVA-Next Mistral multimodal classifier.
 
-Uses royokong/e5-v (LLaVA-Next 8B) for all embeddings in one vector space:
+Uses llava-hf/llava-v1.6-mistral-7b-hf for all embeddings in one vector space:
 - Text-only embeddings (zero-shot labels)
 - Image-only embeddings (candidate frames)
 - Composed text+image embeddings (few-shot queries with example images)
 
+Embedding is the last token's hidden state, L2-normalised.
 All three share the same embedding space, so cosine similarity works across
 any combination.
 """
@@ -26,103 +27,62 @@ _processor = None
 _tokenizer = None
 _load_failed = False
 
-# ── Prompt templates (Llama-3 chat format for E5-V) ─────────────
+# ── Prompt templates (Mistral [INST] format for LLaVA-Next Mistral) ──
 
-_LLAMA3_TPL = (
-    "<|start_header_id|>user<|end_header_id|>\n\n"
-    "{content}"
-    "<|eot_id|>"
-    "<|start_header_id|>assistant<|end_header_id|>\n\n \n"
-)
+# Mistral chat format: [INST] content [/INST]
+TEXT_PROMPT = "[INST] <sent>\nSummary above sentence in one word: [/INST]"
 
-TEXT_PROMPT = _LLAMA3_TPL.format(
-    content="<sent>\nSummary above sentence in one word: "
-)
-
-IMAGE_PROMPT = _LLAMA3_TPL.format(
-    content="<image>\nSummary above image in one word: "
-)
+IMAGE_PROMPT = "[INST] <image>\nSummary above image in one word: [/INST]"
 
 # For composed: image(s) + text instruction → single embedding
-# The text goes before "Summary above image in one word:" to guide what
-# aspect of the image(s) to focus on.
-COMPOSED_PROMPT_SINGLE = _LLAMA3_TPL.format(
-    content="<image>\n{text}\nSummary above image in one word: "
-)
+COMPOSED_PROMPT_SINGLE = "[INST] <image>\n{text}\nSummary above image in one word: [/INST]"
 
-COMPOSED_PROMPT_MULTI = _LLAMA3_TPL.format(
-    content="{image_tokens}\n{text}\nSummary above image in one word: "
-)
+COMPOSED_PROMPT_MULTI = "[INST] {image_tokens}\n{text}\nSummary above image in one word: [/INST]"
 
 
-def _load_processor(model_name: str):
-    """Load the LlavaNextProcessor for E5-V.
+def _ensure_processor_patch_size(processor, model=None):
+    """Ensure the processor has patch_size and vision_feature_select_strategy set.
 
-    Strategy: build the processor from components to avoid stale-cache issues
-    with preprocessor_config.json. The tokenizer comes from the E5-V repo
-    (Llama-3 based), and the image processor is constructed with the standard
-    CLIP-ViT-L/14-336px parameters used by all LLaVA-Next variants.
+    This is the root cause of the 'unsupported operand type(s) for //: int and NoneType'
+    error — the processor tries to compute image_size // patch_size during image
+    processing, and if patch_size is None, it crashes.
     """
-    from transformers import LlavaNextProcessor, AutoTokenizer
+    needs_patch_size = getattr(processor, 'patch_size', None) is None
+    needs_strategy = getattr(processor, 'vision_feature_select_strategy', None) is None
 
-    # --- Attempt 1: direct load (works if cache has all files) ---
-    try:
-        logger.info("Loading processor from %s", model_name)
-        proc = LlavaNextProcessor.from_pretrained(model_name)
-        # Ensure patch computation attributes are set
-        if getattr(proc, 'patch_size', None) is None:
-            proc.patch_size = 14
-            proc.vision_feature_select_strategy = "default"
-        return proc
-    except Exception as e:
-        logger.warning("Direct processor load failed: %s — building manually", e)
+    if not needs_patch_size and not needs_strategy:
+        return
 
-    # --- Attempt 2: build from components (robust) ---
-    # Tokenizer from E5-V (has tokenizer.json, tokenizer_config.json)
-    logger.info("Loading tokenizer from %s", model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # Try to pull from the model's config
+    patch_size = None
+    strategy = None
 
-    # Image processor: standard CLIP-ViT-L/14-336px params
-    # Same across all LLaVA-Next variants (vicuna, mistral, llama3)
-    _clip_kwargs = dict(
-        do_resize=True,
-        size={"shortest_edge": 336},
-        do_center_crop=True,
-        crop_size={"height": 336, "width": 336},
-        do_rescale=True,
-        rescale_factor=1 / 255,
-        do_normalize=True,
-        image_mean=[0.48145466, 0.4578275, 0.40821073],
-        image_std=[0.26862954, 0.26130258, 0.27577711],
-        do_convert_rgb=True,
-    )
+    if model is not None:
+        config = getattr(model, 'config', None)
+        if config is not None:
+            # Check model.config.vision_config.patch_size
+            vision_config = getattr(config, 'vision_config', None)
+            if vision_config is not None:
+                patch_size = getattr(vision_config, 'patch_size', None)
+            # Check model.config.vision_feature_select_strategy
+            strategy = getattr(config, 'vision_feature_select_strategy', None)
 
-    try:
-        from transformers import LlavaNextImageProcessor
-        logger.info("Constructing LlavaNextImageProcessor with CLIP-ViT-L/14-336px defaults")
-        image_processor = LlavaNextImageProcessor(**_clip_kwargs)
-    except (ImportError, TypeError):
-        from transformers import CLIPImageProcessor
-        logger.info("Falling back to CLIPImageProcessor")
-        image_processor = CLIPImageProcessor(**_clip_kwargs)
+    # Fallback defaults for CLIP-ViT-L/14-336px (used by all LLaVA-Next variants)
+    if patch_size is None:
+        patch_size = 14
+    if strategy is None:
+        strategy = "default"
 
-    proc = LlavaNextProcessor(
-        image_processor=image_processor,
-        tokenizer=tokenizer,
-    )
-
-    # Critical: the processor needs these to compute how many image tokens
-    # to generate (used in the // division for patch grid calculation).
-    # Values from llama3-llava-next-8b-hf's config:
-    #   vision_config.patch_size = 14, vision_feature_select_strategy = "default"
-    proc.patch_size = 14
-    proc.vision_feature_select_strategy = "default"
-
-    return proc
+    if needs_patch_size:
+        processor.patch_size = patch_size
+        logger.info("Set processor.patch_size = %d", patch_size)
+    if needs_strategy:
+        processor.vision_feature_select_strategy = strategy
+        logger.info("Set processor.vision_feature_select_strategy = '%s'", strategy)
 
 
 def load_model(model_name: str, device: str = "cuda"):
-    """Load E5-V model + processor (cached)."""
+    """Load LLaVA-Next model + processor (cached)."""
     global _model, _processor, _tokenizer, _load_failed
 
     if _model is not None:
@@ -131,18 +91,25 @@ def load_model(model_name: str, device: str = "cuda"):
     if _load_failed:
         raise RuntimeError("Model loading previously failed. Restart the app to retry.")
 
-    from transformers import LlavaNextForConditionalGeneration
+    from transformers import LlavaNextForConditionalGeneration, LlavaNextProcessor
 
     try:
-        _processor = _load_processor(model_name)
+        logger.info("Loading processor from %s", model_name)
+        _processor = LlavaNextProcessor.from_pretrained(model_name)
 
-        logger.info("Loading E5-V model weights: %s", model_name)
+        logger.info("Loading model weights: %s", model_name)
         _model = LlavaNextForConditionalGeneration.from_pretrained(
             model_name,
-            dtype=torch.float16,
+            torch_dtype=torch.float16,      # was `dtype` — wrong kwarg, silently ignored
+            low_cpu_mem_usage=True,
         ).to(device).eval()
+
+        # Critical: ensure patch_size is set BEFORE any image processing
+        _ensure_processor_patch_size(_processor, _model)
+
         _tokenizer = _processor.tokenizer
-        logger.info("E5-V loaded on %s", device)
+        logger.info("LLaVA-Next loaded on %s (patch_size=%s)",
+                     device, getattr(_processor, 'patch_size', '?'))
     except Exception as e:
         _load_failed = True
         _model = _processor = _tokenizer = None
@@ -163,7 +130,7 @@ def unload_model():
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        logger.info("E5-V model unloaded")
+        logger.info("Model unloaded")
 
 
 def _get_last_token_embedding(
@@ -205,7 +172,7 @@ def encode_texts(
     model_name: str,
     device: str = "cuda",
 ) -> np.ndarray:
-    """Encode text labels into E5-V embeddings.
+    """Encode text labels into embeddings.
 
     Returns
     -------
@@ -231,7 +198,7 @@ def encode_images(
     device: str = "cuda",
     batch_size: int = 8,
 ) -> np.ndarray:
-    """Encode images into E5-V embeddings.
+    """Encode images into embeddings.
 
     Returns
     -------
@@ -262,7 +229,7 @@ def encode_composed(
     model_name: str,
     device: str = "cuda",
 ) -> np.ndarray:
-    """Encode a composed text+image(s) query into a single E5-V embedding.
+    """Encode a composed text+image(s) query into a single embedding.
 
     This is the key function for few-shot: combine the target description
     text with verified example images into one query vector.
@@ -290,7 +257,6 @@ def encode_composed(
             image_tokens=image_tokens.strip(),
             text=text,
         )
-        # LlavaNext processor handles list of images mapped to <image> tokens
         inputs = processor(images=images, text=prompt, return_tensors="pt")
 
     inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -312,7 +278,7 @@ def zero_shot_classify(
 
     Parameters
     ----------
-    image_embeddings : (N, dim) — already computed E5-V image embeddings
+    image_embeddings : (N, dim) — already computed image embeddings
     labels : text labels to compare against
     temperature : softmax temperature (lower = sharper)
 
@@ -357,7 +323,6 @@ def few_shot_classify(
     -------
     list of dicts, each {"positive": prob, "negative": prob}
     """
-    # Build prototype matrix
     labels = ["positive"]
     protos = [query_embedding[0]]
 
@@ -365,12 +330,10 @@ def few_shot_classify(
         labels.append("negative")
         protos.append(negative_embedding[0])
     else:
-        # Without explicit negative, use raw similarity as score
         sims = image_embeddings @ query_embedding.T  # (N, 1)
         results = []
         for i in range(len(sims)):
             score = float(sims[i, 0])
-            # Convert similarity to pseudo-probability with sigmoid
             prob = 1.0 / (1.0 + np.exp(-score / temperature))
             results.append({"positive": prob, "negative": 1.0 - prob})
         return results

@@ -55,12 +55,52 @@ COMPOSED_PROMPT_MULTI = _LLAMA3_TPL.format(
 )
 
 
-def load_model(model_name: str, device: str = "cuda"):
-    """Load E5-V model + processor (cached).
+def _load_processor(model_name: str):
+    """Load the LlavaNextProcessor for E5-V.
 
-    E5-V is a LoRA fine-tune of LLaVA-Next. The processor (image preprocessor)
-    must be loaded from the base model, while the model weights come from E5-V.
+    Strategy: build the processor from components to avoid stale-cache issues
+    with preprocessor_config.json. The tokenizer comes from the E5-V repo
+    (Llama-3 based), and the image processor is constructed with the standard
+    CLIP-ViT-L/14-336px parameters used by all LLaVA-Next variants.
     """
+    from transformers import LlavaNextProcessor, AutoTokenizer, LlavaNextImageProcessor
+
+    # --- Attempt 1: direct load (works if cache has all files) ---
+    try:
+        logger.info("Loading processor from %s", model_name)
+        return LlavaNextProcessor.from_pretrained(model_name)
+    except Exception as e:
+        logger.warning("Direct processor load failed: %s — building manually", e)
+
+    # --- Attempt 2: build from components (robust) ---
+    # Tokenizer from E5-V (has tokenizer.json, tokenizer_config.json)
+    logger.info("Loading tokenizer from %s", model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    # Image processor: standard CLIP-ViT-L/14-336px params
+    # Same across all LLaVA-Next variants (vicuna, mistral, llama3)
+    logger.info("Constructing LlavaNextImageProcessor with CLIP-ViT-L/14-336px defaults")
+    image_processor = LlavaNextImageProcessor(
+        do_resize=True,
+        size={"shortest_edge": 336},
+        do_center_crop=True,
+        crop_size={"height": 336, "width": 336},
+        do_rescale=True,
+        rescale_factor=1 / 255,
+        do_normalize=True,
+        image_mean=[0.48145466, 0.4578275, 0.40821073],
+        image_std=[0.26862954, 0.26130258, 0.27577711],
+        do_convert_rgb=True,
+    )
+
+    return LlavaNextProcessor(
+        image_processor=image_processor,
+        tokenizer=tokenizer,
+    )
+
+
+def load_model(model_name: str, device: str = "cuda"):
+    """Load E5-V model + processor (cached)."""
     global _model, _processor, _tokenizer, _load_failed
 
     if _model is not None:
@@ -69,14 +109,10 @@ def load_model(model_name: str, device: str = "cuda"):
     if _load_failed:
         raise RuntimeError("Model loading previously failed. Restart the app to retry.")
 
-    from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
-
-    # The base model that has the processor config (preprocessor_config.json)
-    BASE_MODEL = "llava-hf/llama3-llava-next-8b-hf"
+    from transformers import LlavaNextForConditionalGeneration
 
     try:
-        logger.info("Loading processor from base model: %s", BASE_MODEL)
-        _processor = LlavaNextProcessor.from_pretrained(BASE_MODEL)
+        _processor = _load_processor(model_name)
 
         logger.info("Loading E5-V model weights: %s", model_name)
         _model = LlavaNextForConditionalGeneration.from_pretrained(
@@ -87,6 +123,7 @@ def load_model(model_name: str, device: str = "cuda"):
         logger.info("E5-V loaded on %s", device)
     except Exception as e:
         _load_failed = True
+        _model = _processor = _tokenizer = None
         logger.error("Failed to load model: %s", e)
         raise
 

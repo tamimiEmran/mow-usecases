@@ -30,6 +30,7 @@ def main():
         server_name=settings.server.host,
         server_port=settings.server.port,
         share=settings.server.share,
+        allowed_paths=[settings.storage.cache_dir],
     )
 
 

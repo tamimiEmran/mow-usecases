@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 _model = None
 _processor = None
 _tokenizer = None
+_load_failed = False
 
 # ── Prompt templates (Llama-3 chat format for E5-V) ─────────────
 
@@ -55,32 +56,50 @@ COMPOSED_PROMPT_MULTI = _LLAMA3_TPL.format(
 
 
 def load_model(model_name: str, device: str = "cuda"):
-    """Load E5-V model + processor (cached)."""
-    global _model, _processor, _tokenizer
+    """Load E5-V model + processor (cached).
+
+    E5-V is a LoRA fine-tune of LLaVA-Next. The processor (image preprocessor)
+    must be loaded from the base model, while the model weights come from E5-V.
+    """
+    global _model, _processor, _tokenizer, _load_failed
 
     if _model is not None:
         return _model, _processor, _tokenizer
 
+    if _load_failed:
+        raise RuntimeError("Model loading previously failed. Restart the app to retry.")
+
     from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
 
-    logger.info("Loading E5-V model: %s", model_name)
-    _processor = LlavaNextProcessor.from_pretrained(model_name)
-    _model = LlavaNextForConditionalGeneration.from_pretrained(
-        model_name,
-        torch_dtype=torch.float16,
-    ).to(device).eval()
-    _tokenizer = _processor.tokenizer
-    logger.info("E5-V loaded on %s", device)
+    # The base model that has the processor config (preprocessor_config.json)
+    BASE_MODEL = "llava-hf/llama3-llava-next-8b-hf"
+
+    try:
+        logger.info("Loading processor from base model: %s", BASE_MODEL)
+        _processor = LlavaNextProcessor.from_pretrained(BASE_MODEL)
+
+        logger.info("Loading E5-V model weights: %s", model_name)
+        _model = LlavaNextForConditionalGeneration.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+        ).to(device).eval()
+        _tokenizer = _processor.tokenizer
+        logger.info("E5-V loaded on %s", device)
+    except Exception as e:
+        _load_failed = True
+        logger.error("Failed to load model: %s", e)
+        raise
 
     return _model, _processor, _tokenizer
 
 
 def unload_model():
     """Free GPU memory."""
-    global _model, _processor, _tokenizer
+    global _model, _processor, _tokenizer, _load_failed
     if _model is not None:
         del _model, _processor, _tokenizer
         _model = _processor = _tokenizer = None
+        _load_failed = False
         import gc
         gc.collect()
         if torch.cuda.is_available():

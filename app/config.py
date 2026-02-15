@@ -68,7 +68,7 @@ class FewShotConfig:
 
 @dataclass
 class PipelineConfig:
-    frames_per_video: int = field(default_factory=lambda: _env_int("FRAMES_PER_VIDEO", 5))
+    frames_per_video: int = field(default_factory=lambda: _env_int("FRAMES_PER_VIDEO", 20))
     cameras: list[str] = field(default_factory=lambda: [
         "front_camera", "left_fisheye", "right_fisheye", "rear_camera",
     ])

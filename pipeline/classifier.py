@@ -68,7 +68,12 @@ def _load_processor(model_name: str):
     # --- Attempt 1: direct load (works if cache has all files) ---
     try:
         logger.info("Loading processor from %s", model_name)
-        return LlavaNextProcessor.from_pretrained(model_name)
+        proc = LlavaNextProcessor.from_pretrained(model_name)
+        # Ensure patch computation attributes are set
+        if getattr(proc, 'patch_size', None) is None:
+            proc.patch_size = 14
+            proc.vision_feature_select_strategy = "default"
+        return proc
     except Exception as e:
         logger.warning("Direct processor load failed: %s — building manually", e)
 
@@ -101,10 +106,19 @@ def _load_processor(model_name: str):
         logger.info("Falling back to CLIPImageProcessor")
         image_processor = CLIPImageProcessor(**_clip_kwargs)
 
-    return LlavaNextProcessor(
+    proc = LlavaNextProcessor(
         image_processor=image_processor,
         tokenizer=tokenizer,
     )
+
+    # Critical: the processor needs these to compute how many image tokens
+    # to generate (used in the // division for patch grid calculation).
+    # Values from llama3-llava-next-8b-hf's config:
+    #   vision_config.patch_size = 14, vision_feature_select_strategy = "default"
+    proc.patch_size = 14
+    proc.vision_feature_select_strategy = "default"
+
+    return proc
 
 
 def load_model(model_name: str, device: str = "cuda"):

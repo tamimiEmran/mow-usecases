@@ -61,9 +61,40 @@ def _refresh_timestamps():
 
 
 def _find_videos_for_source(source_id: str) -> dict[str, str]:
-    """Return {camera_name: video_path} for a source_id."""
+    """Return {camera_name: video_path} for a source_id (cropped videos)."""
     ts = _get_timestamps()
     return ts.get(source_id, {})
+
+
+def _find_full_video(source_id: str) -> str | None:
+    """Find the full composite video for a source_id in the full_video_dir.
+
+    Full videos are named like: m001-20260202-1770014818_video.mp4
+    (no camera suffix).
+    """
+    full_dir = Path(settings.storage.full_video_dir)
+    if not full_dir.exists():
+        return None
+
+    # source_id format: "m001-20260202-1770014818"
+    # Full video filename: "m001-20260202-1770014818_video.mp4"
+    for ext in (".mp4", ".avi", ".mov", ".mkv", ".webm"):
+        candidate = full_dir / f"{source_id}_video{ext}"
+        if candidate.exists():
+            return str(candidate)
+
+    # Fallback: glob for partial match
+    matches = list(full_dir.glob(f"{source_id}*"))
+    if matches:
+        # Prefer the composite (no camera suffix)
+        for m in matches:
+            name = m.stem
+            # Composite has no camera suffix after "_video"
+            if name.endswith("_video") or name == source_id:
+                return str(m)
+        return str(matches[0])
+
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -95,14 +126,6 @@ def _run_embedding(progress=gr.Progress()):
 # Video Viewer
 # ═══════════════════════════════════════════════════════════════════
 
-def _load_video_for_source(source_id: str, camera: str) -> str | None:
-    """Get video path for a given source + camera."""
-    if not source_id:
-        return None
-    videos = _find_videos_for_source(source_id.strip())
-    return videos.get(camera)
-
-
 def _get_available_cameras(source_id: str) -> list[str]:
     """List cameras with videos for this source_id."""
     if not source_id:
@@ -112,24 +135,48 @@ def _get_available_cameras(source_id: str) -> list[str]:
 
 
 def _build_video_viewer_handler():
-    """Create handler that loads a video given source_id + camera selection."""
+    """Create handler that loads full composite or per-camera cropped video."""
 
-    def load_video(source_id: str, camera: str):
-        if not source_id or not camera:
-            return None, "Select a source and camera."
-        path = _load_video_for_source(source_id, camera)
-        if path and Path(path).exists():
-            return path, f"Playing `{camera}` for `{source_id}`"
-        return None, f"No video found for `{source_id}` / `{camera}`"
+    def load_video(source_id: str, view_mode: str):
+        if not source_id:
+            return None, "Enter a source ID."
 
-    def update_camera_choices(source_id: str):
-        cams = _get_available_cameras(source_id)
-        if not cams:
-            return gr.update(choices=[], value=None)
-        default = "front_camera" if "front_camera" in cams else cams[0]
-        return gr.update(choices=cams, value=default)
+        sid = source_id.strip()
 
-    return load_video, update_camera_choices
+        if view_mode == "Full Composite":
+            path = _find_full_video(sid)
+            if path and Path(path).exists():
+                return path, f"Playing full composite for `{sid}`"
+            return None, f"No full video found for `{sid}` in `{settings.storage.full_video_dir}`"
+        else:
+            # view_mode is a camera name
+            videos = _find_videos_for_source(sid)
+            path = videos.get(view_mode)
+            if path and Path(path).exists():
+                return path, f"Playing `{view_mode}` for `{sid}`"
+            return None, f"No `{view_mode}` video found for `{sid}`"
+
+    def update_view_choices(source_id: str):
+        if not source_id:
+            return gr.update(choices=["Full Composite"], value="Full Composite")
+
+        sid = source_id.strip()
+        choices = []
+
+        # Check for full composite
+        if _find_full_video(sid):
+            choices.append("Full Composite")
+
+        # Add available cropped cameras
+        cams = _get_available_cameras(sid)
+        choices.extend(cams)
+
+        if not choices:
+            return gr.update(choices=["Full Composite"], value="Full Composite")
+
+        return gr.update(choices=choices, value=choices[0])
+
+    return load_video, update_view_choices
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -347,22 +394,23 @@ def _status_text() -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 def _build_video_viewer(prefix: str = ""):
-    """Build a video viewer sub-component. Returns (source_input, camera_dropdown, video, info)."""
+    """Build a video viewer sub-component. Returns (source_input, view_dropdown, video)."""
 
-    load_video_fn, update_cameras_fn = _build_video_viewer_handler()
+    load_video_fn, update_view_fn = _build_video_viewer_handler()
 
     with gr.Accordion("📹 Video Viewer", open=False):
-        gr.Markdown("View the full source video for any timestamp.")
+        gr.Markdown("View the full composite video or individual camera feeds for any timestamp.")
         with gr.Row():
             vid_source = gr.Textbox(
                 label="Source ID",
                 placeholder="e.g. m002-20260202-1770014818",
                 scale=3,
             )
-            vid_camera = gr.Dropdown(
-                label="Camera",
-                choices=["front_camera", "left_fisheye", "right_fisheye", "rear_camera"],
-                value="front_camera",
+            vid_view = gr.Dropdown(
+                label="View",
+                choices=["Full Composite", "front_camera", "left_fisheye",
+                         "right_fisheye", "rear_camera"],
+                value="Full Composite",
                 scale=2,
             )
             vid_load_btn = gr.Button("▶ Load", scale=1, size="sm")
@@ -370,20 +418,19 @@ def _build_video_viewer(prefix: str = ""):
         vid_player = gr.Video(label="Video", height=400)
         vid_info = gr.Markdown("")
 
-        # When source changes, update available cameras
         vid_source.change(
-            fn=update_cameras_fn,
+            fn=update_view_fn,
             inputs=[vid_source],
-            outputs=[vid_camera],
+            outputs=[vid_view],
         )
 
         vid_load_btn.click(
             fn=load_video_fn,
-            inputs=[vid_source, vid_camera],
+            inputs=[vid_source, vid_view],
             outputs=[vid_player, vid_info],
         )
 
-    return vid_source, vid_camera, vid_player
+    return vid_source, vid_view, vid_player
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -454,15 +501,16 @@ def _build_usecase_tab(usecase: UseCase):
 
             # Inline video viewer for verification — pre-fills source_id
             gr.Markdown("---")
-            gr.Markdown("**Preview full video for this candidate:**")
+            gr.Markdown("**Preview video for this candidate:**")
 
-            load_video_fn, update_cameras_fn = _build_video_viewer_handler()
+            load_video_fn, update_view_fn = _build_video_viewer_handler()
 
             with gr.Row():
-                verify_vid_camera = gr.Dropdown(
-                    label="Camera",
-                    choices=["front_camera", "left_fisheye", "right_fisheye", "rear_camera"],
-                    value="front_camera",
+                verify_vid_view = gr.Dropdown(
+                    label="View",
+                    choices=["Full Composite", "front_camera", "left_fisheye",
+                             "right_fisheye", "rear_camera"],
+                    value="Full Composite",
                     scale=2,
                 )
                 verify_vid_btn = gr.Button("▶ Play Video", scale=1, size="sm")
@@ -472,7 +520,7 @@ def _build_usecase_tab(usecase: UseCase):
 
             verify_vid_btn.click(
                 fn=load_video_fn,
-                inputs=[current_source, verify_vid_camera],
+                inputs=[current_source, verify_vid_view],
                 outputs=[verify_vid_player, verify_vid_info],
             )
 
@@ -513,11 +561,11 @@ def _build_usecase_tab(usecase: UseCase):
                      current_source, confirm_btn, reject_btn, skip_btn],
         )
 
-        # Auto-update camera choices when candidate loads
+        # Auto-update view choices when candidate loads
         current_source.change(
-            fn=update_cameras_fn,
+            fn=update_view_fn,
             inputs=[current_source],
-            outputs=[verify_vid_camera],
+            outputs=[verify_vid_view],
         )
 
         for btn, ltype in [(confirm_btn, "positive"),
@@ -618,15 +666,16 @@ def _build_custom_tab():
 
             # Inline video viewer
             gr.Markdown("---")
-            gr.Markdown("**Preview full video for this candidate:**")
+            gr.Markdown("**Preview video for this candidate:**")
 
-            load_video_fn, update_cameras_fn = _build_video_viewer_handler()
+            load_video_fn, update_view_fn = _build_video_viewer_handler()
 
             with gr.Row():
-                custom_vid_camera = gr.Dropdown(
-                    label="Camera",
-                    choices=["front_camera", "left_fisheye", "right_fisheye", "rear_camera"],
-                    value="front_camera",
+                custom_vid_view = gr.Dropdown(
+                    label="View",
+                    choices=["Full Composite", "front_camera", "left_fisheye",
+                             "right_fisheye", "rear_camera"],
+                    value="Full Composite",
                     scale=2,
                 )
                 custom_vid_btn = gr.Button("▶ Play Video", scale=1, size="sm")
@@ -636,14 +685,14 @@ def _build_custom_tab():
 
             custom_vid_btn.click(
                 fn=load_video_fn,
-                inputs=[custom_current_source, custom_vid_camera],
+                inputs=[custom_current_source, custom_vid_view],
                 outputs=[custom_vid_player, custom_vid_info],
             )
 
             custom_current_source.change(
-                fn=update_cameras_fn,
+                fn=update_view_fn,
                 inputs=[custom_current_source],
-                outputs=[custom_vid_camera],
+                outputs=[custom_vid_view],
             )
 
         # ── Step 3: Few-Shot ─────────────────────────────────
